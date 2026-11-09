@@ -114,7 +114,7 @@ class App:
             self.result_box.insert(tk.END, f"Tờ {i}: {r.label}  ({r.confidence * 100:.0f}%)\n")
             top = sorted(r.scores.items(), key=lambda kv: -kv[1])[:3]
             for d, v in top:
-                extra = f", ORB {r.inliers.get(d, 0)} điểm" if r.inliers else ""
+                extra = f", {r.inliers.get(d, 0)} điểm khớp" if r.inliers else ""
                 self.result_box.insert(tk.END, f"   {R.format_vnd(d):>12}: {v:.2f}{extra}\n")
         total = sum(r.denom for r in results if r.denom)
         self.total_lbl.config(text=f"Tổng: {R.format_vnd(total)}  ({len(results)} tờ)")

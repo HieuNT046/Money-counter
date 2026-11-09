@@ -428,8 +428,13 @@ def extract_main_note(img, size=(NOTE_W, NOTE_H)):
 #      Chiếu 4 góc ảnh mẫu qua homography được khung ĐẦY ĐỦ của tờ, kể cả phần bị che.
 #   4. Kiểm tra hình học (không lật gương, tứ giác lồi, tỉ lệ cạnh hợp lý, các điểm khớp
 #      trải đủ rộng) và loại phát hiện trùng lặp.
+#   5. Giai đoạn 2 cho tờ chỉ lộ MỘT DẢI HẸP (xòe quạt, tờ phía sau): các điểm khớp gần như
+#      thẳng hàng nên homography (8 bậc tự do) không xác định được. Dùng phép ĐỒNG DẠNG
+#      (xoay + tỉ lệ đều + tịnh tiến, 4 bậc tự do) — xác định được từ một dải hẹp và tự giữ
+#      đúng tỉ lệ dài/rộng của tờ tiền. Chỉ chạy trên các điểm còn lại sau giai đoạn 1.
 FEATURE_KIND = "sift"              # "sift": chính xác hơn | "orb": nhanh hơn
 DETECT_MAX_SIDE = 1400             # cạnh dài của ảnh khi trích đặc trưng để dò nhiều tờ
+DETECT_MIN_SIDE = 1000             # ảnh nhỏ hơn được phóng to tới đây (thêm điểm SIFT ở tờ nhỏ)
 TPL_W, TPL_H = 1000, 450           # kích thước ảnh mẫu (đã nắn) khi trích đặc trưng
 TPL_FEATURES = 8000                # số điểm đặc trưng tối đa trên mỗi ảnh mẫu
 KNN_K = 8                          # số láng giềng xét trong ratio test theo lớp
@@ -439,6 +444,9 @@ RANSAC_REPROJ = 5.0                # sai số chiếu lại tối đa (pixel, �
 MIN_SPREAD = 0.04                  # inlier phủ >= 4% diện tích ảnh mẫu (bao lồi) ...
 MIN_SPREAD_THIN = 0.01             # ... hoặc >= 1% (tờ chỉ lộ một dải mỏng) nhưng khi đó
 THIN_INLIERS = 30                  #     cần >= 30 inlier: vùng càng nhỏ càng cần nhiều bằng chứng
+SIM_MIN_INLIERS = 10               # giai đoạn 2 (phép đồng dạng): số inlier tối thiểu
+SIM_REPROJ = 6.0                   # sai số chiếu lại cho phép đồng dạng (tờ hơi cong, phối cảnh)
+SIM_MIN_EXTENT = 0.3               # inlier phải trải dài >= 30% chiều cao ảnh mẫu
 _RANSAC_METHOD = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
 _TPL_CORNERS = _rect_corners(TPL_W, TPL_H).reshape(-1, 1, 2)
 
@@ -480,20 +488,37 @@ def _plausible(H, quad, img_area, inl_tpl_pts):
     return spread >= MIN_SPREAD or (spread >= MIN_SPREAD_THIN and len(inl_tpl_pts) >= THIN_INLIERS)
 
 
-DUP_CORNER_DIST = 0.15             # 4 góc lệch trung bình < 15% cạnh dài -> cùng một tờ
+DUP_CORNER_DIST = 0.25             # 4 góc lệch trung bình < 25% cạnh dài ...
+DUP_INSIDE = 0.5                   # ... VÀ > 50% inlier nằm trong vùng inlier của tờ đã nhận
 
 
-def _is_duplicate(det, accepted):
-    """Phát hiện mới là trùng nếu 4 góc của nó gần như trùng 4 góc một tờ đã nhận (cùng một
-    tờ khớp với ảnh mẫu khác). Không dùng IoU: các tờ xòe quạt nằm cạnh nhau có IoU rất cao
-    nhưng là các tờ khác nhau. So mọi phép xoay vòng thứ tự góc (tờ lật ngược 180 độ)."""
+def _is_duplicate(det, accepted, qpts):
+    """Phát hiện mới là trùng (cùng một tờ khớp với ảnh mẫu khác) khi 4 góc gần trùng 4 góc
+    một tờ đã nhận VÀ các điểm khớp nằm cùng một vùng ảnh. Chỉ xét góc là chưa đủ: các tờ
+    xòe quạt chung điểm xoay có góc gần nhau nhưng phần lộ ra (nơi có điểm khớp) khác nhau.
+    So mọi phép xoay vòng thứ tự góc (tờ lật ngược 180 độ)."""
     q = det["quad"]
     side = np.linalg.norm(q[1] - q[0])
+    pts = qpts[det["q_inl"]]
     for a in accepted:
         d = min(np.linalg.norm(np.roll(a["quad"], k, axis=0) - q, axis=1).mean() for k in range(4))
-        if d < DUP_CORNER_DIST * side:
+        if d >= DUP_CORNER_DIST * side:
+            continue
+        hull = cv2.convexHull(qpts[a["q_inl"]].reshape(-1, 1, 2))
+        margin = 0.03 * side
+        inside = np.mean([cv2.pointPolygonTest(hull, (float(x), float(y)), True) >= -margin
+                          for x, y in pts])
+        if inside > DUP_INSIDE:
             return True
     return False
+
+
+def _max_extent(pts):
+    """Khoảng cách lớn nhất giữa hai điểm (đường kính tập điểm)."""
+    h = cv2.convexHull(pts.reshape(-1, 1, 2).astype(np.float32)).reshape(-1, 2)
+    if len(h) < 2:
+        return 0.0
+    return float(np.max(np.linalg.norm(h[:, None] - h[None], axis=2)))
 
 
 class FeatureIndex:
@@ -552,7 +577,17 @@ class FeatureIndex:
             des = des.astype(np.float32)
         qpts = np.float32([k.pt for k in kps]).reshape(-1, 2)
         matches = self._class_ratio_matches(des)
-        return self._sequential_ransac(qpts, matches, img.shape[0] * img.shape[1], max_notes)
+        alive = np.ones(len(qpts), bool)        # điểm ảnh truy vấn chưa thuộc tờ nào
+        accepted = []
+        # Giai đoạn 1: homography (chặt chẽ, cho khung chính xác cả phối cảnh)
+        self._sequential_ransac(qpts, matches, alive, accepted, max_notes, MIN_INLIERS,
+                                lambda *a: self._fit(*a, img_area=img.shape[0] * img.shape[1]))
+        # Giai đoạn 2: phép đồng dạng cho các tờ chỉ lộ một dải hẹp
+        self._sequential_ransac(qpts, matches, alive, accepted, max_notes, SIM_MIN_INLIERS,
+                                lambda *a: self._fit_similarity(*a, img_shape=img.shape))
+        for d in accepted:              # vị trí đặt nhãn: tâm phần nhìn thấy (các inlier)
+            d["anchor"] = qpts[d["q_inl"]].mean(axis=0)
+        return accepted
 
     def _class_ratio_matches(self, des):
         """Ratio test theo lớp. Trả về {chỉ số ảnh mẫu: (chỉ số điểm ảnh truy vấn, chỉ số điểm mẫu)}."""
@@ -576,6 +611,7 @@ class FeatureIndex:
         return {t: (np.array(q), np.array(l)) for t, (q, l) in per.items()}
 
     def _fit(self, t, q_idx, t_idx, qpts, img_area):
+        """Homography (8 bậc tự do) + kiểm tra hình học."""
         src = self.tpls[t]["pts"][t_idx].reshape(-1, 1, 2)
         dst = qpts[q_idx].reshape(-1, 1, 2)
         H, mask = cv2.findHomography(src, dst, _RANSAC_METHOD, RANSAC_REPROJ,
@@ -589,28 +625,51 @@ class FeatureIndex:
         if not _plausible(H, quad, img_area, self.tpls[t]["pts"][t_idx[mask]]):
             return None
         return {"tpl": t, "denom": self.tpls[t]["denom"], "quad": quad,
-                "inliers": int(mask.sum()), "q_inl": q_idx[mask]}
+                "inliers": int(mask.sum()), "q_inl": q_idx[mask], "model": "homography"}
 
-    def _sequential_ransac(self, qpts, matches, img_area, max_notes):
-        alive = np.ones(len(qpts), bool)        # điểm ảnh truy vấn chưa thuộc tờ nào
+    def _fit_similarity(self, t, q_idx, t_idx, qpts, img_shape):
+        """Phép đồng dạng (4 bậc tự do) cho tờ chỉ lộ một dải hẹp. Không thể lật gương và
+        luôn giữ đúng tỉ lệ dài/rộng nên chỉ cần kiểm tra kích thước và độ trải dài."""
+        src = self.tpls[t]["pts"][t_idx].reshape(-1, 1, 2)
+        dst = qpts[q_idx].reshape(-1, 1, 2)
+        A, mask = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC,
+                                              ransacReprojThreshold=SIM_REPROJ,
+                                              maxIters=4000, confidence=0.999)
+        if A is None or mask is None:
+            return None
+        mask = mask.ravel().astype(bool)
+        if mask.sum() < SIM_MIN_INLIERS:
+            return None
+        note_w = np.sqrt(abs(np.linalg.det(A[:, :2]))) * TPL_W
+        long_side = max(img_shape[:2])
+        if not 0.1 * long_side <= note_w <= 3 * long_side:
+            return None
+        if _max_extent(self.tpls[t]["pts"][t_idx[mask]]) < SIM_MIN_EXTENT * TPL_H:
+            return None
+        quad = cv2.transform(_TPL_CORNERS, A).reshape(4, 2)
+        return {"tpl": t, "denom": self.tpls[t]["denom"], "quad": quad,
+                "inliers": int(mask.sum()), "q_inl": q_idx[mask], "model": "similarity"}
+
+    def _sequential_ransac(self, qpts, matches, alive, accepted, max_notes, min_inliers, fit):
+        """RANSAC lặp: mỗi vòng lấy mô hình nhiều inlier nhất trong mọi ảnh mẫu, nhận một tờ,
+        đánh dấu các điểm đã dùng (alive=False), lặp tới khi không còn mô hình hợp lệ."""
         cache = {}                              # ảnh mẫu -> (số điểm còn sống lúc fit, kết quả)
-        accepted = []
         while len(accepted) < max_notes:
             best = None
             for t, (q_idx, t_idx) in matches.items():
                 live = alive[q_idx]
                 n_live = int(live.sum())
-                if n_live < MIN_INLIERS:
+                if n_live < min_inliers:
                     continue
                 if t not in cache or cache[t][0] != n_live:    # chỉ fit lại khi mất điểm
-                    cache[t] = (n_live, self._fit(t, q_idx[live], t_idx[live], qpts, img_area))
+                    cache[t] = (n_live, fit(t, q_idx[live], t_idx[live], qpts))
                 r = cache[t][1]
                 if r is not None and (best is None or r["inliers"] > best["inliers"]):
                     best = r
             if best is None:
                 break
             alive[best["q_inl"]] = False
-            if not _is_duplicate(best, accepted):
+            if not _is_duplicate(best, accepted, qpts):
                 accepted.append(best)
         return accepted
 
@@ -627,6 +686,7 @@ class NoteResult:
     color_scores: dict = field(default_factory=dict)
     inliers: dict = field(default_factory=dict)
     note_img: np.ndarray | None = None
+    anchor: np.ndarray | None = None       # chỗ đặt nhãn (tâm phần nhìn thấy), ảnh đã thu nhỏ
 
     @property
     def label(self):
@@ -688,6 +748,9 @@ class BanknoteRecognizer:
             return small, self._recognize_classic(small, use_features, max_notes)
 
         big = resize_max(img, DETECT_MAX_SIDE)
+        up = DETECT_MIN_SIDE / max(big.shape[:2])
+        if up > 1:                      # ảnh nhỏ: phóng to để tờ nhỏ/dải hẹp có đủ điểm SIFT
+            big = cv2.resize(big, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
         scale = small.shape[1] / big.shape[1]
         balanced = white_balance(small)
         results = []
@@ -697,7 +760,7 @@ class BanknoteRecognizer:
             note = cv2.warpPerspective(balanced, M, (NOTE_W, NOTE_H))
             conf = min(1.0, 0.5 + d["inliers"] / 100)
             results.append(NoteResult(d["denom"], conf, quad, {d["denom"]: conf}, {},
-                                      {d["denom"]: d["inliers"]}, note))
+                                      {d["denom"]: d["inliers"]}, note, d["anchor"] * scale))
         results += self._leftover_regions(small, balanced, results, max_notes - len(results))
         return small, results
 
@@ -742,14 +805,23 @@ def ascii_label(r):
 
 def draw_results(img, results):
     out = img.copy()
-    for r in results:
+    h, w = out.shape[:2]
+    font, fs = cv2.FONT_HERSHEY_SIMPLEX, max(0.45, min(0.8, w / 1200))
+    labels = []
+    for i, r in enumerate(results):
         color = (0, 200, 0) if r.denom else (0, 0, 255)
         q = r.quad.astype(np.int32)
-        cv2.polylines(out, [q], True, color, 3)
-        x, y = q[:, 0].min(), max(q[:, 1].min() - 10, 25)
-        text = f"{ascii_label(r)} ({r.confidence * 100:.0f}%)"
-        cv2.putText(out, text, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5)
-        cv2.putText(out, text, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.polylines(out, [q], True, color, 2)
+        text = f"{i + 1}: {ascii_label(r)}"
+        (tw, th), _ = cv2.getTextSize(text, font, fs, 2)
+        if r.anchor is not None:         # đặt nhãn giữa phần nhìn thấy của tờ
+            x, y = r.anchor[0] - tw / 2, r.anchor[1] + th / 2
+        else:
+            x, y = q[:, 0].min(), q[:, 1].min() - 10
+        labels.append((text, int(np.clip(x, 5, w - tw - 5)), int(np.clip(y, th + 5, h - 45)), color))
+    for text, x, y, color in labels:     # vẽ chữ sau cùng để không bị khung đè lên
+        cv2.putText(out, text, (x, y), font, fs, (0, 0, 0), 5)
+        cv2.putText(out, text, (x, y), font, fs, color, 2)
     total = sum(r.denom for r in results if r.denom)
     t = f"Tong: {total:,}".replace(",", ".") + " VND"
     cv2.putText(out, t, (10, out.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 5)

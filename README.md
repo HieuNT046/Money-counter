@@ -51,19 +51,20 @@ Cách tách nền rồi tìm hình chữ nhật thất bại khi các tờ chồ
 2. **Ratio test theo lớp** (Lowe 2004): giữ một cặp khớp chỉ khi láng giềng gần nhất gần hơn hẳn láng giềng gần nhất thuộc *mệnh giá khác*. Chi tiết chung của mọi tờ (chân dung, quốc huy, quốc hiệu) không phân biệt được nên tự bị loại.
 3. **RANSAC lặp** (sequential RANSAC, ước lượng MAGSAC): lấy homography có nhiều inlier nhất trong mọi ảnh mẫu → nhận một tờ → xóa các điểm đã dùng → lặp lại. Chiếu 4 góc ảnh mẫu qua homography được khung đầy đủ của tờ, kể cả phần bị che.
 4. **Kiểm tra hình học**: không lật gương (det > 0), tứ giác lồi, tỉ lệ cạnh 1.5–3.2, inlier phủ đủ rộng (dải hẹp thì cần nhiều inlier hơn); loại phát hiện trùng khi 4 góc gần như trùng nhau.
-5. Vùng tìm được bằng tách nền mà không trùng tờ nào ở trên được phân loại bằng màu (tờ chưa có ảnh mẫu).
+5. **Giai đoạn 2 — tờ chỉ lộ một dải hẹp** (tay xòe tiền, tờ phía sau): các điểm khớp gần thẳng hàng nên homography (8 bậc tự do) không xác định được. Dùng **phép đồng dạng** (xoay + tỉ lệ đều + tịnh tiến, 4 bậc tự do), ước lượng được từ dải hẹp và tự giữ đúng tỉ lệ tờ tiền; chỉ chạy trên các điểm còn lại sau giai đoạn 1.
+6. Ảnh nhỏ (< 1000 px) được phóng to trước khi trích đặc trưng. Vùng tìm được bằng tách nền mà không trùng tờ nào ở trên được phân loại bằng màu (tờ chưa có ảnh mẫu).
 
 Kết quả trên bộ ảnh ghép `tao_bo_test.py --seed 2` (150 ảnh, 483 tờ, 2–6 tờ/ảnh; tham số được chỉnh trên bộ `--seed 1`):
 
-| | Cách cũ | Cách mới |
-|---|---|---|
-| Tờ nhận đúng (vị trí + mệnh giá) | 0.6% | **96.9%** |
-| Dự đoán đúng (precision) | 33% | **100%** |
-| Ảnh đúng tổng tiền | 0% | **92.0%** |
-| Tờ chỉ nhìn thấy < 40% | 0% | 82.3% |
-| Tờ nhìn thấy 40–70% / ≥ 70% | 0% | 99.0% / 100% |
+| | Cách cũ | Homography | + Giai đoạn 2 (đồng dạng) |
+|---|---|---|---|
+| Tờ nhận đúng (vị trí + mệnh giá) | 0.6% | 96.9% | **98.1%** |
+| Dự đoán đúng (precision) | 33% | 100% | **100%** |
+| Ảnh đúng tổng tiền | 0% | 92.0% | **94.7%** |
+| Tờ chỉ nhìn thấy < 40% | 0% | 82.3% | **89.9%** |
+| Tờ nhìn thấy 40–70% / ≥ 70% | 0% | 99.0% / 100% | 99.0% / 100% |
 
-Lưu ý: tờ tiền trong ảnh ghép lấy từ chính ảnh mẫu nên kết quả lạc quan hơn ảnh chụp thật; cần bổ sung ảnh chụp thật để đánh giá cuối cùng. Thời gian ~1 s/ảnh (SIFT); đặt `FEATURE_KIND = "orb"` để nhanh hơn.
+Lưu ý: tờ tiền trong ảnh ghép lấy từ chính ảnh mẫu nên kết quả lạc quan hơn ảnh chụp thật; cần bổ sung ảnh chụp thật (độ phân giải gốc) để đánh giá cuối cùng. Ảnh tải từ web quá nhỏ (dải tiền chỉ 10–30 px) sẽ không đủ chi tiết để nhận các tờ phía sau. Thời gian ~0.6 s/ảnh (SIFT); đặt `FEATURE_KIND = "orb"` để nhanh hơn.
 
 ## Nguyên lý (cách cổ điển, dùng khi tắt so khớp đặc trưng)
 
