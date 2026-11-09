@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Cache ảnh mẫu (tự sinh lại khi chạy)
+templates/_cache.pkl
+templates/_cache.pkl.tmp
+
+# Ảnh kết quả do recognizer.py sinh ra
+*_ketqua.jpg
