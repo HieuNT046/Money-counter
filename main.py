@@ -5,6 +5,7 @@ Giao diện nhận diện mệnh giá tiền Việt Nam (xử lý ảnh cổ đi
 Chạy:  python main.py
 """
 import os
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -15,7 +16,6 @@ from PIL import Image, ImageTk
 import recognizer as R
 
 VIEW_W, VIEW_H = 820, 560
-WEBCAM_EVERY = 3            # nhận diện 1 lần mỗi N khung hình để giữ mượt
 
 
 class App:
@@ -26,7 +26,9 @@ class App:
         root.minsize(900, 560)
         self.rec = R.BanknoteRecognizer()
         self.cap = None
-        self.frame_no = 0
+        self._busy = False              # luồng nhận diện webcam đang chạy
+        self._pending = None            # kết quả mới từ luồng nhận diện, chờ hiển thị
+        self._rec_lock = threading.Lock()
         self.last_img = None        # ảnh gốc (BGR) đang hiển thị / khung hình hiện tại
         self.last_results = []
         self._photo = None
@@ -56,7 +58,7 @@ class App:
         ttk.Spinbox(cam_row, from_=0, to=5, width=4, textvariable=self.cam_idx).pack(side=tk.LEFT)
 
         self.use_feat = tk.BooleanVar(value=True)
-        ttk.Checkbutton(right, text="So khớp đặc trưng ORB (cần ảnh mẫu)",
+        ttk.Checkbutton(right, text="So khớp đặc trưng (cần ảnh mẫu, nhận được tờ bị đè)",
                         variable=self.use_feat).pack(anchor="w", pady=(8, 2))
 
         ttk.Separator(right).pack(fill=tk.X, pady=8)
@@ -118,7 +120,13 @@ class App:
         self.total_lbl.config(text=f"Tổng: {R.format_vnd(total)}  ({len(results)} tờ)")
 
     def process(self, img):
-        small, res = self.rec.recognize(img, use_features=self.use_feat.get())
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            with self._rec_lock:
+                small, res = self.rec.recognize(img, use_features=self.use_feat.get())
+        finally:
+            self.root.config(cursor="")
         self.last_img, self.last_results = small, res
         self.show(R.draw_results(small, res))
         self.show_results(res)
@@ -150,7 +158,6 @@ class App:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             self.cap = cap
             self.cam_btn.config(text="Tắt webcam (giữ khung hình)")
-            self.frame_no = 0
             self.webcam_loop()
         else:
             self.cap.release()
@@ -158,20 +165,31 @@ class App:
             self.cam_btn.config(text="Bật webcam")
 
     def webcam_loop(self):
+        """Hiển thị webcam liên tục; việc nhận diện (~0.5-1 s/khung) chạy ở luồng riêng
+        để hình không bị đứng. Kết quả mới nhất được vẽ lên các khung hình tiếp theo."""
         if self.cap is None:
             return
         ok, frame = self.cap.read()
         if ok:
-            self.frame_no += 1
-            if self.frame_no % WEBCAM_EVERY == 0 or not self.last_results:
-                small, res = self.rec.recognize(frame, use_features=self.use_feat.get())
-                self.last_results = res
-                self.show_results(res)
-            else:
-                small = R.resize_max(frame)
+            if self._pending is not None:
+                self.last_results, self._pending = self._pending, None
+                self.show_results(self.last_results)
+            if not self._busy:
+                self._busy = True
+                threading.Thread(target=self._recognize_worker,
+                                 args=(frame.copy(), self.use_feat.get()), daemon=True).start()
+            small = R.resize_max(frame)
             self.last_img = small
             self.show(R.draw_results(small, self.last_results))
         self.root.after(15, self.webcam_loop)
+
+    def _recognize_worker(self, frame, use_feat):
+        try:
+            with self._rec_lock:
+                _, res = self.rec.recognize(frame, use_features=use_feat)
+            self._pending = res
+        finally:
+            self._busy = False
 
     # ------------------------------------------------------------------ #
     def save_template(self):
@@ -191,7 +209,8 @@ class App:
         messagebox.showinfo("Đã lưu", f"Đã lưu mẫu:\n{path}")
 
     def reload_templates(self):
-        self.rec.db.reload()
+        with self._rec_lock:
+            self.rec.reload()
         self.update_template_label()
 
     def open_template_folder(self):

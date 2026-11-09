@@ -186,8 +186,12 @@ def find_notes(img, max_notes=10):
     return keep
 
 
-def warp_note(img, rect_or_pts):
-    """Nắn tờ tiền về ảnh NOTE_W x NOTE_H (cạnh dài nằm ngang)."""
+def _rect_corners(w, h):
+    return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+
+
+def warp_note(img, rect_or_pts, size=(NOTE_W, NOTE_H)):
+    """Nắn tờ tiền về ảnh size = (rộng, cao), mặc định NOTE_W x NOTE_H (cạnh dài nằm ngang)."""
     if isinstance(rect_or_pts, tuple):
         pts = cv2.boxPoints(rect_or_pts)
     else:
@@ -196,15 +200,13 @@ def warp_note(img, rect_or_pts):
     if np.linalg.norm(tr - tl) < np.linalg.norm(bl - tl):     # đang dựng đứng -> xoay
         tl, tr, br, bl = tr, br, bl, tl
     src = np.array([tl, tr, br, bl], dtype=np.float32)
-    dst = np.array([[0, 0], [NOTE_W - 1, 0], [NOTE_W - 1, NOTE_H - 1], [0, NOTE_H - 1]],
-                   dtype=np.float32)
-    M = cv2.getPerspectiveTransform(src, dst)
-    return cv2.warpPerspective(img, M, (NOTE_W, NOTE_H)), src
+    M = cv2.getPerspectiveTransform(src, _rect_corners(*size))
+    return cv2.warpPerspective(img, M, size), src
 
 
 def full_image_quad(img):
     h, w = img.shape[:2]
-    return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+    return _rect_corners(w, h)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +255,62 @@ def _prep_gray(note_bgr):
     return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
 
 
+def _scan_template_files(folder):
+    """Duyệt templates/<mệnh giá>/*.<ảnh>. Trả về (đường dẫn tương đối, đường dẫn, mệnh giá, chữ ký)."""
+    for d in sorted(os.listdir(folder)):
+        sub = os.path.join(folder, d)
+        if not os.path.isdir(sub) or not d.isdigit() or int(d) not in DENOMINATIONS:
+            continue
+        for p in sorted(glob.glob(os.path.join(sub, "*"))):
+            if p.lower().endswith(IMG_EXTS):
+                st = os.stat(p)
+                rel = os.path.relpath(p, folder).replace(os.sep, "/")
+                yield rel, p, int(d), (st.st_mtime_ns, st.st_size)
+
+
+def _load_template_entries(folder, cache_name, key, compute, force=False):
+    """Tính đặc trưng cho mọi ảnh mẫu, có bộ nhớ đệm.
+
+    Kết quả của compute(path, denom) được lưu vào folder/cache_name cùng chữ ký file
+    (mtime, size); lần sau chỉ tính lại ảnh mới hoặc đã sửa. Đổi `key` (tham số xử lý)
+    thì toàn bộ cache cũ bị bỏ. Trả về ({đường dẫn tương đối: entry}, thống kê).
+    """
+    os.makedirs(folder, exist_ok=True)
+    cache_path = os.path.join(folder, cache_name)
+    old = {}
+    if not force:
+        try:
+            with open(cache_path, "rb") as f:
+                data = pickle.load(f)
+            if data.get("key") == key:
+                old = data.get("files", {})
+        except Exception:
+            pass
+
+    files, stats = {}, {"cache": 0, "computed": 0}
+    for rel, path, denom, sig in _scan_template_files(folder):
+        entry = old.get(rel)
+        if entry is not None and entry.get("sig") == sig and entry.get("denom") == denom:
+            stats["cache"] += 1
+        else:
+            entry = compute(path, denom)
+            if entry is None:
+                continue
+            entry["sig"], entry["denom"] = sig, denom
+            stats["computed"] += 1
+        files[rel] = entry
+
+    if stats["computed"] or set(files) != set(old):
+        try:
+            tmp = cache_path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump({"key": key, "files": files}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, cache_path)
+        except OSError as e:
+            print(f"Không ghi được cache: {e}")
+    return files, stats
+
+
 class TemplateDB:
     """Thư mục mẫu: templates/<mệnh giá>/*.jpg  (ví dụ templates/500000/mat_truoc.jpg)."""
 
@@ -285,68 +343,18 @@ class TemplateDB:
         return [cv2.KeyPoint(float(x), float(y), float(sz), float(a), float(r), int(o), int(c))
                 for x, y, sz, a, r, o, c in arr]
 
-    def _load_cache(self, path):
-        try:
-            with open(path, "rb") as f:
-                data = pickle.load(f)
-            if data.get("key") == self._cache_key():
-                return data.get("files", {})
-        except Exception:
-            pass
-        return {}
-
-    def _save_cache(self, path, files):
-        try:
-            tmp = path + ".tmp"
-            with open(tmp, "wb") as f:
-                pickle.dump({"key": self._cache_key(), "files": files}, f,
-                            protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp, path)
-        except OSError as e:
-            print(f"Không ghi được cache: {e}")
-
     def _compute_entry(self, path, denom):
         img = imread_unicode(path)
         if img is None:
             return None
         note = extract_main_note(img)
         kps, des = self.orb.detectAndCompute(_prep_gray(note), None)
-        return {"denom": denom, "kps": self._kps_to_array(kps or []),
-                "des": des, "hist": hue_histogram(note)}
+        return {"kps": self._kps_to_array(kps or []), "des": des, "hist": hue_histogram(note)}
 
     def reload(self, force=False):
         """Nạp ảnh mẫu. Dùng cache nếu ảnh không đổi; force=True để tính lại toàn bộ."""
-        os.makedirs(self.folder, exist_ok=True)
-        cache_path = os.path.join(self.folder, self.CACHE_NAME)
-        old = {} if force else self._load_cache(cache_path)
-        files, changed = {}, False
-        self.last_reload_stats = {"cache": 0, "computed": 0}
-
-        for d in sorted(os.listdir(self.folder)):
-            sub = os.path.join(self.folder, d)
-            if not os.path.isdir(sub) or not d.isdigit() or int(d) not in DENOMINATIONS:
-                continue
-            denom = int(d)
-            for p in sorted(glob.glob(os.path.join(sub, "*"))):
-                if not p.lower().endswith(IMG_EXTS):
-                    continue
-                rel = os.path.relpath(p, self.folder).replace(os.sep, "/")
-                st = os.stat(p)
-                sig = (st.st_mtime_ns, st.st_size)
-                entry = old.get(rel)
-                if entry is not None and entry.get("sig") == sig and entry.get("denom") == denom:
-                    self.last_reload_stats["cache"] += 1
-                else:
-                    entry = self._compute_entry(p, denom)
-                    if entry is None:
-                        continue
-                    entry["sig"] = sig
-                    changed = True
-                    self.last_reload_stats["computed"] += 1
-                files[rel] = entry
-
-        if changed or set(files) != set(old):
-            self._save_cache(cache_path, files)
+        files, self.last_reload_stats = _load_template_entries(
+            self.folder, self.CACHE_NAME, self._cache_key(), self._compute_entry, force)
 
         self.templates = []
         sums = {}
@@ -397,11 +405,214 @@ class TemplateDB:
         return result
 
 
-def extract_main_note(img):
+def extract_main_note(img, size=(NOTE_W, NOTE_H)):
     img = resize_max(img)
     rects = find_notes(img, max_notes=1)
-    note, _ = warp_note(white_balance(img), rects[0] if rects else full_image_quad(img))
+    note, _ = warp_note(white_balance(img), rects[0] if rects else full_image_quad(img), size)
     return note
+
+
+# --------------------------------------------------------------------------- #
+# Nhận diện NHIỀU tờ, kể cả tờ bị đè / bị che một phần
+# --------------------------------------------------------------------------- #
+# Cách tách nền rồi tìm hình chữ nhật (find_notes) thất bại khi các tờ chồng lên nhau:
+# chúng dính thành một khối không còn tỉ lệ của tờ tiền. Ở đây mỗi tờ được tìm trực tiếp
+# bằng điểm đặc trưng cục bộ, nên chỉ cần PHẦN CÒN NHÌN THẤY có đủ điểm khớp:
+#
+#   1. Trích đặc trưng (SIFT hoặc ORB) trên toàn ảnh và trên mọi ảnh mẫu.
+#   2. Ratio test THEO LỚP (Lowe 2004): giữ một cặp khớp chỉ khi láng giềng gần nhất
+#      gần hơn hẳn láng giềng gần nhất thuộc MỆNH GIÁ KHÁC. Chi tiết chung của mọi tờ
+#      (chân dung, quốc huy, dòng quốc hiệu) không phân biệt được nên tự bị loại.
+#   3. RANSAC lặp (sequential RANSAC): trong mọi ảnh mẫu, lấy homography có nhiều inlier
+#      nhất -> nhận một tờ -> xóa các điểm đã dùng -> lặp lại cho tờ tiếp theo.
+#      Chiếu 4 góc ảnh mẫu qua homography được khung ĐẦY ĐỦ của tờ, kể cả phần bị che.
+#   4. Kiểm tra hình học (không lật gương, tứ giác lồi, tỉ lệ cạnh hợp lý, các điểm khớp
+#      trải đủ rộng) và loại phát hiện trùng lặp.
+FEATURE_KIND = "sift"              # "sift": chính xác hơn | "orb": nhanh hơn
+DETECT_MAX_SIDE = 1400             # cạnh dài của ảnh khi trích đặc trưng để dò nhiều tờ
+TPL_W, TPL_H = 1000, 450           # kích thước ảnh mẫu (đã nắn) khi trích đặc trưng
+TPL_FEATURES = 8000                # số điểm đặc trưng tối đa trên mỗi ảnh mẫu
+KNN_K = 8                          # số láng giềng xét trong ratio test theo lớp
+CLASS_RATIO = 0.85                 # ngưỡng ratio test theo lớp
+MIN_INLIERS = 15                   # số inlier tối thiểu để chấp nhận một tờ
+RANSAC_REPROJ = 5.0                # sai số chiếu lại tối đa (pixel, ảnh truy vấn)
+MIN_SPREAD = 0.04                  # inlier phủ >= 4% diện tích ảnh mẫu (bao lồi) ...
+MIN_SPREAD_THIN = 0.01             # ... hoặc >= 1% (tờ chỉ lộ một dải mỏng) nhưng khi đó
+THIN_INLIERS = 30                  #     cần >= 30 inlier: vùng càng nhỏ càng cần nhiều bằng chứng
+_RANSAC_METHOD = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
+_TPL_CORNERS = _rect_corners(TPL_W, TPL_H).reshape(-1, 1, 2)
+
+
+def _make_features(kind, n):
+    if kind == "sift":
+        return cv2.SIFT_create(nfeatures=n, contrastThreshold=0.03)
+    if kind == "orb":
+        return cv2.ORB_create(nfeatures=n or 15000, scaleFactor=1.2, nlevels=8, fastThreshold=10)
+    raise ValueError(f"Loại đặc trưng không hỗ trợ: {kind}")
+
+
+def _quad_iou(a, b):
+    a = np.asarray(a, np.float32).reshape(-1, 2)
+    b = np.asarray(b, np.float32).reshape(-1, 2)
+    inter, _ = cv2.intersectConvexConvex(a, b)
+    union = cv2.contourArea(a) + cv2.contourArea(b) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _plausible(H, quad, img_area, inl_tpl_pts):
+    """Kiểm tra homography có tương ứng với một tờ tiền thật hay không."""
+    if np.linalg.det(H[:2, :2]) <= 0:                   # lật gương: tờ tiền thật không thể
+        return False
+    q = quad.reshape(-1, 1, 2).astype(np.float32)
+    if not cv2.isContourConvex(q):
+        return False
+    if not 0.002 * img_area <= cv2.contourArea(q) <= 2.0 * img_area:
+        return False
+    e = np.linalg.norm(quad - np.roll(quad, -1, axis=0), axis=1)   # trên, phải, dưới, trái
+    if e.min() < 15:
+        return False
+    if not 1.5 <= (e[0] + e[2]) / (e[1] + e[3]) <= 3.2:              # tỉ lệ dài/rộng
+        return False
+    if max(e[0], e[2]) > 2 * min(e[0], e[2]) or max(e[1], e[3]) > 2 * min(e[1], e[3]):
+        return False                                                 # phối cảnh quá méo
+    hull = cv2.convexHull(inl_tpl_pts.reshape(-1, 1, 2).astype(np.float32))
+    spread = cv2.contourArea(hull) / (TPL_W * TPL_H)
+    return spread >= MIN_SPREAD or (spread >= MIN_SPREAD_THIN and len(inl_tpl_pts) >= THIN_INLIERS)
+
+
+DUP_CORNER_DIST = 0.15             # 4 góc lệch trung bình < 15% cạnh dài -> cùng một tờ
+
+
+def _is_duplicate(det, accepted):
+    """Phát hiện mới là trùng nếu 4 góc của nó gần như trùng 4 góc một tờ đã nhận (cùng một
+    tờ khớp với ảnh mẫu khác). Không dùng IoU: các tờ xòe quạt nằm cạnh nhau có IoU rất cao
+    nhưng là các tờ khác nhau. So mọi phép xoay vòng thứ tự góc (tờ lật ngược 180 độ)."""
+    q = det["quad"]
+    side = np.linalg.norm(q[1] - q[0])
+    for a in accepted:
+        d = min(np.linalg.norm(np.roll(a["quad"], k, axis=0) - q, axis=1).mean() for k in range(4))
+        if d < DUP_CORNER_DIST * side:
+            return True
+    return False
+
+
+class FeatureIndex:
+    """Chỉ mục đặc trưng của mọi ảnh mẫu, dùng để dò nhiều tờ (kể cả bị đè) trong một ảnh."""
+
+    def __init__(self, folder, kind=FEATURE_KIND):
+        self.folder, self.kind = folder, kind
+        self.tpl_extractor = _make_features(kind, TPL_FEATURES)
+        self.query_extractor = _make_features(kind, 0)
+        self.reload()
+
+    def _cache_key(self):
+        return ("features", 1, self.kind, TPL_W, TPL_H, TPL_FEATURES, MAX_SIDE)
+
+    def _compute_entry(self, path, denom):
+        img = imread_unicode(path)
+        if img is None:
+            return None
+        note = extract_main_note(img, (TPL_W, TPL_H))
+        kps, des = self.tpl_extractor.detectAndCompute(_prep_gray(note), None)
+        if des is None:
+            return None
+        return {"pts": np.float32([k.pt for k in kps]).reshape(-1, 2), "des": des}
+
+    def reload(self, force=False):
+        files, self.last_reload_stats = _load_template_entries(
+            self.folder, f"_cache_{self.kind}.pkl", self._cache_key(), self._compute_entry, force)
+        entries = [(rel, e) for rel, e in files.items() if len(e["pts"]) >= MIN_INLIERS]
+        self.tpls = [{"denom": e["denom"], "path": rel, "pts": e["pts"]} for rel, e in entries]
+        self.matcher = None
+        if not entries:
+            return
+        descs = [e["des"] for _, e in entries]
+        self.owner_tpl = np.concatenate([np.full(len(d), i) for i, d in enumerate(descs)])
+        self.owner_denom = np.array([self.tpls[i]["denom"] for i in self.owner_tpl])
+        self.local_idx = np.concatenate([np.arange(len(d)) for d in descs])
+        all_des = np.vstack(descs)
+        if self.kind == "sift":
+            self.matcher = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=64))
+            all_des = all_des.astype(np.float32)
+        else:
+            self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        self.matcher.add([all_des])
+        self.matcher.train()
+
+    # ------------------------------------------------------------------ #
+    def detect(self, img, max_notes=10):
+        """Dò mọi tờ trong ảnh BGR. Trả về danh sách dict(denom, quad 4x2 theo toạ độ img,
+        inliers, tpl) — quad theo thứ tự góc trên-trái, trên-phải, dưới-phải, dưới-trái của tờ."""
+        if self.matcher is None:
+            return []
+        kps, des = self.query_extractor.detectAndCompute(_prep_gray(img), None)
+        if des is None or len(kps) < MIN_INLIERS:
+            return []
+        if self.kind == "sift":
+            des = des.astype(np.float32)
+        qpts = np.float32([k.pt for k in kps]).reshape(-1, 2)
+        matches = self._class_ratio_matches(des)
+        return self._sequential_ransac(qpts, matches, img.shape[0] * img.shape[1], max_notes)
+
+    def _class_ratio_matches(self, des):
+        """Ratio test theo lớp. Trả về {chỉ số ảnh mẫu: (chỉ số điểm ảnh truy vấn, chỉ số điểm mẫu)}."""
+        per = {}
+        for nbrs in self.matcher.knnMatch(des, k=KNN_K):
+            if not nbrs:
+                continue
+            c0 = self.owner_denom[nbrs[0].trainIdx]
+            d_other = next((n.distance for n in nbrs if self.owner_denom[n.trainIdx] != c0), None)
+            limit = CLASS_RATIO * d_other if d_other is not None else np.inf
+            seen = set()
+            for n in nbrs:              # mọi ảnh mẫu cùng mệnh giá đủ gần đều được nhận
+                if n.distance >= limit:
+                    break
+                t = int(self.owner_tpl[n.trainIdx])
+                if t not in seen:
+                    seen.add(t)
+                    q, l = per.setdefault(t, ([], []))
+                    q.append(n.queryIdx)
+                    l.append(int(self.local_idx[n.trainIdx]))
+        return {t: (np.array(q), np.array(l)) for t, (q, l) in per.items()}
+
+    def _fit(self, t, q_idx, t_idx, qpts, img_area):
+        src = self.tpls[t]["pts"][t_idx].reshape(-1, 1, 2)
+        dst = qpts[q_idx].reshape(-1, 1, 2)
+        H, mask = cv2.findHomography(src, dst, _RANSAC_METHOD, RANSAC_REPROJ,
+                                     maxIters=4000, confidence=0.999)
+        if H is None or mask is None:
+            return None
+        mask = mask.ravel().astype(bool)
+        if mask.sum() < MIN_INLIERS:
+            return None
+        quad = cv2.perspectiveTransform(_TPL_CORNERS, H).reshape(4, 2)
+        if not _plausible(H, quad, img_area, self.tpls[t]["pts"][t_idx[mask]]):
+            return None
+        return {"tpl": t, "denom": self.tpls[t]["denom"], "quad": quad,
+                "inliers": int(mask.sum()), "q_inl": q_idx[mask]}
+
+    def _sequential_ransac(self, qpts, matches, img_area, max_notes):
+        alive = np.ones(len(qpts), bool)        # điểm ảnh truy vấn chưa thuộc tờ nào
+        cache = {}                              # ảnh mẫu -> (số điểm còn sống lúc fit, kết quả)
+        accepted = []
+        while len(accepted) < max_notes:
+            best = None
+            for t, (q_idx, t_idx) in matches.items():
+                live = alive[q_idx]
+                n_live = int(live.sum())
+                if n_live < MIN_INLIERS:
+                    continue
+                if t not in cache or cache[t][0] != n_live:    # chỉ fit lại khi mất điểm
+                    cache[t] = (n_live, self._fit(t, q_idx[live], t_idx[live], qpts, img_area))
+                r = cache[t][1]
+                if r is not None and (best is None or r["inliers"] > best["inliers"]):
+                    best = r
+            if best is None:
+                break
+            alive[best["q_inl"]] = False
+            if not _is_duplicate(best, accepted):
+                accepted.append(best)
+        return accepted
 
 
 # --------------------------------------------------------------------------- #
@@ -423,10 +634,15 @@ class NoteResult:
 
 
 class BanknoteRecognizer:
-    def __init__(self, template_folder=None):
+    def __init__(self, template_folder=None, feature_kind=FEATURE_KIND):
         if template_folder is None:
             template_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
         self.db = TemplateDB(template_folder)
+        self.index = FeatureIndex(template_folder, feature_kind)
+
+    def reload(self, force=False):
+        self.db.reload(force)
+        self.index.reload(force)
 
     def classify_note(self, note_bgr, use_features=True):
         note = note_bgr
@@ -459,18 +675,62 @@ class BanknoteRecognizer:
             best = None
         return best, conf, scores, color, inliers
 
-    def recognize(self, img, use_features=True, max_notes=10):
-        """Nhận diện tất cả tờ tiền trong ảnh. Trả về (ảnh đã thu nhỏ, danh sách NoteResult)."""
-        img = resize_max(img)
-        rects = find_notes(img, max_notes=max_notes)
-        regions = rects if rects else [full_image_quad(img)]
-        balanced = white_balance(img)
+    def recognize(self, img, use_features=True, max_notes=10, method="multi"):
+        """Nhận diện tất cả tờ tiền trong ảnh. Trả về (ảnh đã thu nhỏ, danh sách NoteResult).
+
+        method="multi"  : dò từng tờ bằng đặc trưng + RANSAC lặp (nhận được tờ bị đè),
+                          phần còn lại bổ sung bằng tách nền + màu.
+        method="classic": cách cũ — tách nền, tìm hình chữ nhật, phân loại màu + ORB.
+        use_features=False: chỉ dùng tách nền + màu (không cần ảnh mẫu).
+        """
+        small = resize_max(img)
+        if not use_features or method == "classic" or self.index.matcher is None:
+            return small, self._recognize_classic(small, use_features, max_notes)
+
+        big = resize_max(img, DETECT_MAX_SIDE)
+        scale = small.shape[1] / big.shape[1]
+        balanced = white_balance(small)
+        results = []
+        for d in self.index.detect(big, max_notes):
+            quad = (d["quad"] * scale).astype(np.float32)
+            M = cv2.getPerspectiveTransform(quad, _rect_corners(NOTE_W, NOTE_H))
+            note = cv2.warpPerspective(balanced, M, (NOTE_W, NOTE_H))
+            conf = min(1.0, 0.5 + d["inliers"] / 100)
+            results.append(NoteResult(d["denom"], conf, quad, {d["denom"]: conf}, {},
+                                      {d["denom"]: d["inliers"]}, note))
+        results += self._leftover_regions(small, balanced, results, max_notes - len(results))
+        return small, results
+
+    def _recognize_classic(self, small, use_features, max_notes):
+        rects = find_notes(small, max_notes=max_notes)
+        regions = rects if rects else [full_image_quad(small)]
+        balanced = white_balance(small)
         results = []
         for r in regions:
             note, quad = warp_note(balanced, r)
             d, conf, scores, color, inl = self.classify_note(note, use_features)
             results.append(NoteResult(d, conf, quad, scores, color, inl, note))
-        return img, results
+        return results
+
+    def _leftover_regions(self, small, balanced, found, n):
+        """Vùng hình chữ nhật tìm bằng tách nền mà không trùng tờ nào đã dò được
+        (ví dụ tờ chưa có ảnh mẫu): phân loại bằng màu."""
+        if n <= 0:
+            return []
+        covered = np.zeros(small.shape[:2], np.uint8)
+        for r in found:
+            cv2.fillConvexPoly(covered, r.quad.astype(np.int32), 255)
+        out = []
+        for rect in find_notes(small, max_notes=n):
+            box = np.zeros_like(covered)
+            cv2.fillConvexPoly(box, cv2.boxPoints(rect).astype(np.int32), 255)
+            area = np.count_nonzero(box)
+            if area == 0 or np.count_nonzero(box & covered) > 0.2 * area:
+                continue
+            note, quad = warp_note(balanced, rect)
+            d, conf, scores, color, inl = self.classify_note(note, use_features=False)
+            out.append(NoteResult(d, conf, quad, scores, color, inl, note))
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -533,7 +793,7 @@ def main(argv):
     print(f"Đã nạp {len(rec.db.templates)} ảnh mẫu: {rec.db.counts()} "
           f"(từ cache: {st['cache']}, tính mới: {st['computed']})")
     if argv[0] == "--rebuild":
-        rec.db.reload(force=True)
+        rec.reload(force=True)
         print("Đã tạo lại cache.")
         return
     if argv[0] == "--eval":

@@ -7,6 +7,11 @@ venv/
 # Cache ảnh mẫu (tự sinh lại khi chạy)
 templates/_cache.pkl
 templates/_cache.pkl.tmp
+templates/_cache_*.pkl
+templates/_cache_*.pkl.tmp
 
 # Ảnh kết quả do recognizer.py sinh ra
 *_ketqua.jpg
+
+# Bộ ảnh test sinh tự động (tạo lại bằng tao_bo_test.py)
+bo_test*/
